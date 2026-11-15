@@ -144,6 +144,10 @@ class DealOut(BaseModel):
     safety_score: Optional[float] = None
     fit_score: Optional[float] = None
     history: list[dict[str, Any]] = Field(default_factory=list)
+    # Who is asking: the seller who listed it, or the buyer behind the latest
+    # blind evaluation. Everyone else sees only the listing itself.
+    is_seller: bool = False
+    is_evaluator: bool = False
     created_at: datetime
 
 

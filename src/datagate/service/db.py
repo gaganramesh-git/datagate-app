@@ -42,6 +42,11 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Owner of everything created without accounts (and of data from before accounts
+# existed). With login required nobody can sign in as this user.
+LOCAL_USER_ID = "local"
+
+
 class JobStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -62,6 +67,27 @@ class Base(DeclarativeBase):
     pass
 
 
+class UserRecord(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    email: Mapped[str] = mapped_column(String(254), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class SessionRecord(Base):
+    """A signed-in browser. The id is the SHA-256 of the cookie token, so a copy of
+    the database cannot be used to sign in."""
+
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class DatasetRecord(Base):
     __tablename__ = "datasets"
 
@@ -74,6 +100,7 @@ class DatasetRecord(Base):
     n_cols: Mapped[int] = mapped_column(Integer, default=0)
     fingerprint: Mapped[str] = mapped_column(String(64), default="")
     profile: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -84,6 +111,7 @@ class SpecRecord(Base):
     dataset_id: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("datasets.id"), nullable=True)
     spec: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -101,6 +129,7 @@ class JobRecord(Base):
     progress: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     report_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     started_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True)
@@ -121,6 +150,7 @@ class ReportRecord(Base):
     quarantine_ref: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     blind: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
     engine_version: Mapped[str] = mapped_column(String(32), default="")
+    owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -137,6 +167,10 @@ class DealRecord(Base):
     state: Mapped[str] = mapped_column(String(16), default=DealState.LISTED.value)
     report_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     history: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    seller_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    # The buyer behind the latest blind evaluation: the only other person who may
+    # read that score-only report or accept/decline on it.
+    evaluator_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -174,9 +208,22 @@ def _add_missing_columns() -> None:
                     f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type}'))
 
 
+_OWNER_COLUMNS = (("datasets", "owner_id"), ("specs", "owner_id"), ("jobs", "owner_id"),
+                  ("reports", "owner_id"), ("deals", "seller_id"))
+
+
+def _backfill_owners() -> None:
+    """Rows from before accounts existed belong to the implicit local user."""
+    with engine.begin() as conn:
+        for table, column in _OWNER_COLUMNS:
+            conn.execute(text(f'UPDATE "{table}" SET "{column}" = :owner '
+                              f'WHERE "{column}" IS NULL'), {"owner": LOCAL_USER_ID})
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
     _add_missing_columns()
+    _backfill_owners()
 
 
 def session_scope() -> Session:

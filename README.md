@@ -154,11 +154,11 @@ Infrastructure sits behind small seams, with zero-setup defaults:
 | Database | SQLite (WAL) via SQLAlchemy | Postgres — `DATAGATE_DATABASE_URL` |
 | Blob storage | local, content-addressed | S3/MinIO — implement `Storage` |
 | Job queue | in-process thread pool | Celery/Arq — reimplement `worker.submit()` |
-| Auth | open, for local use | `DATAGATE_ACCESS_PASSWORD` (shared password) · `DATAGATE_API_KEYS=key1,key2` (API clients) |
+| Auth | open, one local user | `DATAGATE_REQUIRE_LOGIN=1` (accounts: sign up, sign in, private data) · `DATAGATE_API_KEYS=key1,key2` (API clients, no-accounts mode only) |
 
-Configuration: `DATAGATE_HOME` (default `./var`), `DATAGATE_DATABASE_URL`, `DATAGATE_STORAGE_DIR`, `DATAGATE_WORKERS`, `DATAGATE_MAX_UPLOAD_BYTES`, `DATAGATE_API_KEYS`, `DATAGATE_ACCESS_PASSWORD`, `DATAGATE_USE_LLM`, `DATAGATE_LLM_API_KEY`, `DATAGATE_LLM_MODEL`.
+Configuration: `DATAGATE_HOME` (default `./var`), `DATAGATE_DATABASE_URL`, `DATAGATE_STORAGE_DIR`, `DATAGATE_WORKERS`, `DATAGATE_MAX_UPLOAD_BYTES`, `DATAGATE_API_KEYS`, `DATAGATE_REQUIRE_LOGIN`, `DATAGATE_SESSION_DAYS`, `DATAGATE_USE_LLM`, `DATAGATE_LLM_API_KEY`, `DATAGATE_LLM_MODEL`.
 
-A `Dockerfile` is included but was written without a Docker daemon available — build and test it before relying on it. **Putting it on the internet.** Set `DATAGATE_ACCESS_PASSWORD` to lock the whole site (UI and API) behind one shared password, using the browser's built-in login prompt. Any username works; only the password is checked, and `/health` stays open for platform health checks. It is one shared password, not per-user accounts, so everyone who gets in sees every report. Don't also set `DATAGATE_API_KEYS` for the web UI: the UI cannot send an API key. Use HTTPS in front (Render and most hosts provide it), because Basic auth sends the password with every request.
+A `Dockerfile` is included but was written without a Docker daemon available — build and test it before relying on it. **Putting it on the internet.** Set `DATAGATE_REQUIRE_LOGIN=1` (the Docker image already does). Anyone can then create an account with an email and password, and sees only their own datasets, specs, analyses, reports and history; another person's link answers "not found". Passwords are hashed with scrypt, sessions are random tokens in an HttpOnly cookie (only their hash is stored), and failed sign-ins are rate-limited. Marketplace listings are visible to everyone signed in; a buyer's score, report and decision are visible only to that buyer and the seller. Not included: email verification and password reset (there is no mail service, so a forgotten password is reset by the operator), and deleting an account (datasets can be purged one at a time). Serve it over HTTPS — Render and most hosts do — because the cookie is marked Secure only when the request arrives over HTTPS.
 
 ### Blind evaluation (marketplace preview)
 

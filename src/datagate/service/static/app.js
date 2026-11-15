@@ -11,6 +11,9 @@ const TOTAL_CHECKS = 16;
 /* ---------- helpers ---------- */
 async function api(path, options = {}) {
   const res = await fetch(path, options);
+  if (res.status === 401 && !path.startsWith("/auth/")) {
+    window.dispatchEvent(new Event("dg-signed-out"));   // session ended: show sign-in
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch (e) { /* non-JSON body */ }
@@ -679,7 +682,7 @@ function ReportView({ reportId }) {
 }
 
 /* ---------- history ---------- */
-function HistoryPage() {
+function HistoryPage({ hosted }) {
   const [jobs, setJobs] = useState(null);
   const [error, setError] = useState(null);
   const [q, setQ] = useState("");
@@ -694,7 +697,7 @@ function HistoryPage() {
     : html`<td class="num"><b style=${{ color: toneColor(t(v)) }}>${v.toFixed(2)}</b></td>`;
   return html`<div>
     <h1 class="title">History</h1>
-    <p class="lede">Every check run on this machine, newest first.</p>
+    <p class="lede">${hosted ? "Every check you have run, newest first." : "Every check run on this machine, newest first."}</p>
     ${error ? html`<div class="notice error" role="alert" style=${{ marginTop: "24px" }}><b>Could not load history.</b> ${error}</div>` : null}
     ${!jobs && !error ? html`<${Loading} />` : null}
     ${jobs && jobs.length === 0 ? html`<div class="empty" style=${{ marginTop: "28px" }}>
@@ -785,11 +788,11 @@ function DealRow({ deal, onChanged, setError }) {
           ${deal.report_id ? html`<button class="btn small primary" onClick=${() => go(`#/report/${deal.report_id}/market`)}>Read the score-only report</button>` : null}
           ${canEvaluate ? html`<button class="btn small" disabled=${busy} onClick=${() => setOpen(!open)} aria-expanded=${String(open)}>
             ${deal.report_id ? "Evaluate again" : "Evaluate blind"}</button>` : null}
-          ${deal.state === "evaluated" ? html`
+          ${deal.state === "evaluated" && deal.is_evaluator ? html`
             <button class="btn small" disabled=${busy} onClick=${() => setConfirm("accept")}>Accept</button>
             <button class="btn small danger" disabled=${busy} onClick=${() => setConfirm("decline")}>Decline</button>` : null}
         </div>
-        ${canEvaluate ? html`<button class="linkbtn seller" disabled=${busy} onClick=${() => setConfirm("withdraw")}>Seller: withdraw listing</button>` : null}
+        ${canEvaluate && deal.is_seller ? html`<button class="linkbtn seller" disabled=${busy} onClick=${() => setConfirm("withdraw")}>Withdraw your listing</button>` : null}
       </div>`}
 
     ${open && canEvaluate ? html`<div class="evalform">
@@ -807,7 +810,7 @@ function DealRow({ deal, onChanged, setError }) {
   </div>`;
 }
 
-function MarketPage() {
+function MarketPage({ hosted }) {
   const [deals, setDeals] = useState(null);
   const [error, setError] = useState(null);
   const [file, setFile] = useState(null);
@@ -834,7 +837,9 @@ function MarketPage() {
   return html`<div>
     <h1 class="title">Marketplace</h1>
     <p class="lede">A buyer vets a seller's dataset and gets a signed, score-only report — never the rows.</p>
-    <div class="notice warn" style=${{ marginTop: "22px" }}><b>Preview.</b> There are no payments, identity checks or escrow, and anyone using this installation can act as either party.</div>
+    <div class="notice warn" style=${{ marginTop: "22px" }}><b>Preview.</b> ${hosted
+      ? "There are no payments, identity checks or escrow. Buyers see the shape of your data and a score, never the rows."
+      : "There are no payments, identity checks or escrow, and anyone using this installation can act as either party."}</div>
     ${error ? html`<div class="notice error" role="alert"><b>Something went wrong.</b> ${error}</div>` : null}
 
     <div class="section-head"><h2>Listed datasets</h2><p>Buyers see the shape of the data only</p></div>
@@ -842,7 +847,7 @@ function MarketPage() {
       ? html`<p class="meta">Nothing listed yet. List one below to try a blind evaluation.</p>`
       : deals.map((d) => html`<${DealRow} key=${d.id} deal=${d} onChanged=${load} setError=${setError} />`)}
 
-    <div class="section-head"><h2>List a dataset</h2><p>As the seller · the file stays on this machine</p></div>
+    <div class="section-head"><h2>List a dataset</h2><p>${hosted ? "As the seller · buyers never receive the file" : "As the seller · the file stays on this machine"}</p></div>
     <form class="form" onSubmit=${list}>
       <${FileDrop} file=${file} onFile=${setFile} label="Dataset to list" title="Drop the dataset to list" hint="Any supported format" />
       <div style=${{ height: "20px" }}></div>
@@ -860,10 +865,68 @@ function MarketPage() {
   </div>`;
 }
 
+/* ---------- accounts ---------- */
+function AuthScreen({ onAuthed }) {
+  const [mode, setMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const signup = mode === "signup";
+
+  async function submit(e) {
+    e.preventDefault();
+    setBusy(true); setError(null);
+    try {
+      onAuthed(await postJSON(signup ? "/auth/signup" : "/auth/login", { email, password }));
+      go("#/");
+    } catch (err) { setError(err.message); }
+    setBusy(false);
+  }
+  const switchMode = () => { setMode(signup ? "signin" : "signup"); setError(null); };
+
+  return html`<div class="authwrap"><main class="authcard">
+    <div class="brand">${Mark}<b>DATAGATE</b></div>
+    <h1 class="title">${signup ? "Create your account" : "Sign in"}</h1>
+    <p class="lede">${signup
+      ? "Check any dataset before you train on it. Your uploads, reports and history stay on your account."
+      : "Pick up where you left off: your datasets, reports and history."}</p>
+    ${error ? html`<div class="notice error" role="alert" style=${{ marginTop: "22px" }}>${error}</div>` : null}
+    <form onSubmit=${submit} style=${{ marginTop: "26px" }}>
+      <label class="field"><${FieldLabel} text="Email" />
+        <input type="email" name="email" autocomplete="email" required autofocus
+          value=${email} onInput=${(e) => setEmail(e.target.value)} /></label>
+      <label class="field"><${FieldLabel} text="Password" opt=${signup ? "8 characters or more" : null} />
+        <input type="password" name="password" required minlength=${signup ? 8 : null} maxlength="128"
+          autocomplete=${signup ? "new-password" : "current-password"}
+          value=${password} onInput=${(e) => setPassword(e.target.value)} /></label>
+      <button class="btn primary" type="submit" disabled=${busy || !email || !password}>
+        ${busy ? html`<span class="spin"></span>${signup ? "Creating" : "Signing in"}` : html`${Staff}${signup ? "Create account" : "Sign in"}`}</button>
+    </form>
+    <p class="meta authswitch">${signup ? "Already have an account? " : "New to DataGate? "}
+      <button class="linkbtn" type="button" onClick=${switchMode}>${signup ? "Sign in" : "Create an account"}</button></p>
+  </main></div>`;
+}
+
 /* ---------- shell ---------- */
 function App() {
   const [theme, toggleTheme] = useTheme();
   const [page, arg, from] = useRoute();
+  const [me, setMe] = useState(undefined);   // undefined = still asking the server
+  useEffect(() => {
+    api("/auth/me").then(setMe).catch(() => setMe({ login_required: false, user: null }));
+    const out = () => setMe((m) => (m && m.login_required ? { login_required: true, user: null } : m));
+    window.addEventListener("dg-signed-out", out);
+    return () => window.removeEventListener("dg-signed-out", out);
+  }, []);
+  async function signOut() {
+    try { await api("/auth/logout", { method: "POST" }); } catch (e) { /* already signed out */ }
+    setMe({ login_required: true, user: null });
+    go("#/");
+  }
+  if (me === undefined) return html`<div class="authwrap"><${Loading} /></div>`;
+  if (me.login_required && !me.user) return html`<${AuthScreen} onAuthed=${setMe} />`;
+  const hosted = me.login_required;
   const tab = page === "market" || (page === "report" && from === "market") ? "market"
     : page === "history" || page === "report" ? "history" : "check";
   const nav = [["check", "#/", "Check", I.check], ["history", "#/history", "History", I.history],
@@ -880,14 +943,17 @@ function App() {
         <button class="themebtn" onClick=${toggleTheme}
           aria-label=${theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}>
           ${theme === "dark" ? I.sun : I.moon}<span>${theme === "dark" ? "Light" : "Dark"}</span></button>
-        <span class="ver">engine 0.2 · runs locally</span>
+        ${hosted ? html`<div class="acct">
+          <span class="acct-email" title=${me.user.email}>${me.user.email}</span>
+          <button class="linkbtn acct-out" onClick=${signOut}>Sign out</button></div>`
+          : html`<span class="ver">engine 0.2 · runs locally</span>`}
       </div>
     </header>
     <main class="main"><div class="page">
       ${page === "report" ? html`<${ReportView} reportId=${arg} />` : null}
       ${page !== "report" && tab === "check" ? html`<${CheckFlow} />` : null}
-      ${page !== "report" && tab === "history" ? html`<${HistoryPage} />` : null}
-      ${page !== "report" && tab === "market" ? html`<${MarketPage} />` : null}
+      ${page !== "report" && tab === "history" ? html`<${HistoryPage} hosted=${hosted} />` : null}
+      ${page !== "report" && tab === "market" ? html`<${MarketPage} hosted=${hosted} />` : null}
     </div></main>
   </div>`;
 }

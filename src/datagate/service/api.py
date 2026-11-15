@@ -11,27 +11,28 @@ receives a signed, score-only report. No payments, identity or escrow yet.
 
 from __future__ import annotations
 
-import base64
-import hmac
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import polars as pl
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import or_
 
 from datagate import export, signing
 from datagate.analyzers.base import registered_analyzers
 from datagate.ingest.loader import SUPPORTED_SUFFIXES, load_dataset
 from datagate.ingest.profiler import profile_dataset
 from datagate.orchestrator import default_analyzers
-from datagate.registry import Registry
 from datagate.report import render_markdown
 from datagate.service import worker
+from datagate.service.auth import User, current_user, registry_for
+from datagate.service.auth import router as auth_router
 from datagate.service.config import settings
 from datagate.service.db import (
     DatasetRecord,
@@ -93,36 +94,20 @@ app = FastAPI(
     description="Is this dataset safe, and will it help my model?",
     lifespan=lifespan,
 )
+app.include_router(auth_router)
 
 
-_GATE_OPEN_PATHS = {"/health"}   # health checks must work without credentials
+_UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 
 
-def _password_ok(header: str | None) -> bool:
-    """True when an `Authorization: Basic ...` header carries the shared password.
-
-    The username is ignored; only the password is checked, in constant time.
-    """
-    if not header or not header.lower().startswith("basic "):
-        return False
-    try:
-        decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf8")
-    except (ValueError, UnicodeDecodeError):
-        return False
-    _, _, password = decoded.partition(":")
-    return hmac.compare_digest(password.encode("utf8"),
-                               settings.access_password.encode("utf8"))
-
-
-# Defined before `security_headers` so that one wraps it: a refused request still
-# gets the security headers.
+# Belt and braces on top of SameSite=Lax cookies: a state-changing request that
+# names a different origin than the host it was sent to is refused.
 @app.middleware("http")
-async def password_gate(request, call_next):
-    if (settings.access_password and request.url.path not in _GATE_OPEN_PATHS
-            and not _password_ok(request.headers.get("authorization"))):
-        return PlainTextResponse(
-            "Password required.", status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="DataGate", charset="UTF-8"'})
+async def origin_guard(request, call_next):
+    origin = request.headers.get("origin")
+    if (request.method in _UNSAFE and origin
+            and urlparse(origin).netloc != request.headers.get("host", "")):
+        return PlainTextResponse("Cross-origin request refused.", status_code=403)
     return await call_next(request)
 
 
@@ -137,21 +122,21 @@ async def security_headers(request, call_next):
     return response
 
 
-def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
-    """Light API-key auth. Unset DATAGATE_API_KEYS = open, for local dev only."""
-    if not settings.auth_enabled:
-        return
-    supplied = (x_api_key or "").encode("utf8")
-    if not any(hmac.compare_digest(supplied, key.encode("utf8"))
-               for key in settings.api_keys):
-        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
-
-
-AUTH = [Depends(require_api_key)]
+# For routes that need a signed-in user but not who they are.
+AUTH = [Depends(current_user)]
 
 
 def _not_found(what: str) -> HTTPException:
     return HTTPException(status_code=404, detail=f"{what} not found")
+
+
+def _owned(session, model, row_id: Optional[str], user: User, what: str):
+    """A row the user owns. Someone else's row is reported as not found, so ids
+    cannot be probed for existence."""
+    row = session.get(model, row_id) if row_id else None
+    if row is None or row.owner_id != user.id:
+        raise _not_found(what)
+    return row
 
 
 # -- meta ---------------------------------------------------------------------------
@@ -177,8 +162,9 @@ def meta() -> Meta:
 # -- datasets -----------------------------------------------------------------------
 
 
-@app.post("/datasets", response_model=DatasetSummary, dependencies=AUTH)
-def create_dataset(file: UploadFile = File(...)) -> DatasetSummary:
+@app.post("/datasets", response_model=DatasetSummary)
+def create_dataset(file: UploadFile = File(...),
+                   user: User = Depends(current_user)) -> DatasetSummary:
     """Upload a dataset. Returns the statistical profile immediately."""
     filename = Path(file.filename or "upload").name
     suffix = Path(filename).suffix.lower()
@@ -208,7 +194,7 @@ def create_dataset(file: UploadFile = File(...)) -> DatasetSummary:
         raise HTTPException(status_code=400, detail=f"could not parse dataset: {exc}")
 
     # Provenance: have we seen (most of) this data before?
-    registry = Registry()
+    registry = registry_for(user.id)
     seen = [{"name": m.name, "kind": m.kind, "containment": round(m.containment, 3),
              "exact": m.exact} for m in registry.match(ds, min_containment=0.2)[:5]]
     registry.add(ds, name=filename, kind="upload")
@@ -216,36 +202,33 @@ def create_dataset(file: UploadFile = File(...)) -> DatasetSummary:
     with session_scope() as session:
         record = DatasetRecord(
             filename=filename, storage_ref=ref, format=ds.format, size_bytes=size,
-            n_rows=ds.n_rows, n_cols=ds.n_cols, fingerprint=digest, profile=profile)
+            n_rows=ds.n_rows, n_cols=ds.n_cols, fingerprint=digest, profile=profile,
+            owner_id=user.id)
         session.add(record)
         session.commit()
         return _dataset_summary(record, seen_before=seen)
 
 
-@app.get("/datasets", response_model=list[DatasetSummary], dependencies=AUTH)
-def list_datasets(limit: int = Query(50, ge=1, le=200)) -> list[DatasetSummary]:
+@app.get("/datasets", response_model=list[DatasetSummary])
+def list_datasets(limit: int = Query(50, ge=1, le=200),
+                  user: User = Depends(current_user)) -> list[DatasetSummary]:
     with session_scope() as session:
-        records = (session.query(DatasetRecord)
+        records = (session.query(DatasetRecord).filter_by(owner_id=user.id)
                    .order_by(DatasetRecord.created_at.desc()).limit(limit).all())
         return [_dataset_summary(r) for r in records]
 
 
-@app.get("/datasets/{dataset_id}", response_model=DatasetSummary, dependencies=AUTH)
-def get_dataset(dataset_id: str) -> DatasetSummary:
+@app.get("/datasets/{dataset_id}", response_model=DatasetSummary)
+def get_dataset(dataset_id: str, user: User = Depends(current_user)) -> DatasetSummary:
     with session_scope() as session:
-        record = session.get(DatasetRecord, dataset_id)
-        if record is None:
-            raise _not_found("dataset")
-        return _dataset_summary(record)
+        return _dataset_summary(_owned(session, DatasetRecord, dataset_id, user, "dataset"))
 
 
-@app.delete("/datasets/{dataset_id}", dependencies=AUTH)
-def purge_dataset(dataset_id: str) -> dict[str, Any]:
+@app.delete("/datasets/{dataset_id}")
+def purge_dataset(dataset_id: str, user: User = Depends(current_user)) -> dict[str, Any]:
     """Delete the stored data. Past reports stay readable; exports stop working."""
     with session_scope() as session:
-        record = session.get(DatasetRecord, dataset_id)
-        if record is None:
-            raise _not_found("dataset")
+        record = _owned(session, DatasetRecord, dataset_id, user, "dataset")
         ref, fingerprint = record.storage_ref, record.fingerprint
         record.storage_ref = ""
         session.flush()
@@ -253,17 +236,22 @@ def purge_dataset(dataset_id: str) -> dict[str, Any]:
         session.commit()
     if ref and not still_used:
         get_storage().delete(ref)
-        Registry().remove(fingerprint)
+        registry_for(user.id).remove(fingerprint)
     return {"purged": True, "blob_deleted": bool(ref and not still_used)}
 
 
 # -- specs --------------------------------------------------------------------------
 
 
-def _load_for_spec(session, dataset_id: Optional[str]):
+def _load_for_spec(session, dataset_id: Optional[str], user: Optional[User]):
+    """Load a dataset to parse a spec against. `user` is None only for a blind
+    evaluation, where the buyer reads the seller's listed data (shape only)."""
     if not dataset_id:
         return None
-    record = session.get(DatasetRecord, dataset_id)
+    if user is not None:
+        record = _owned(session, DatasetRecord, dataset_id, user, "dataset")
+    else:
+        record = session.get(DatasetRecord, dataset_id)
     if record is None:
         raise _not_found("dataset")
     if not record.storage_ref:
@@ -274,31 +262,31 @@ def _load_for_spec(session, dataset_id: Optional[str]):
     return dataset
 
 
-@app.post("/specs", response_model=SpecResponse, dependencies=AUTH)
-def create_spec(request: SpecRequest) -> SpecResponse:
+@app.post("/specs", response_model=SpecResponse)
+def create_spec(request: SpecRequest, user: User = Depends(current_user)) -> SpecResponse:
     """Compile the objective + brief into a ProjectSpec.
 
     May come back with clarifying questions — the client is expected to show the
     parsed spec for review and PATCH corrections before starting an analysis.
     """
     with session_scope() as session:
-        dataset = _load_for_spec(session, request.dataset_id)
+        dataset = _load_for_spec(session, request.dataset_id, user)
         spec = compile_spec(request.description, dataset,
                             target_column=request.target_column,
                             project_brief=request.project_brief)
-        row = SpecRecord(dataset_id=request.dataset_id, spec=spec.model_dump(mode="json"))
+        row = SpecRecord(dataset_id=request.dataset_id, spec=spec.model_dump(mode="json"),
+                         owner_id=user.id)
         session.add(row)
         session.commit()
         return SpecResponse(id=row.id, spec=spec, needs_clarification=spec.is_ambiguous)
 
 
-@app.patch("/specs/{spec_id}", response_model=SpecResponse, dependencies=AUTH)
-def update_spec(spec_id: str, update: SpecUpdate) -> SpecResponse:
+@app.patch("/specs/{spec_id}", response_model=SpecResponse)
+def update_spec(spec_id: str, update: SpecUpdate,
+                user: User = Depends(current_user)) -> SpecResponse:
     """Accept user corrections to a parsed spec (the spec-review screen)."""
     with session_scope() as session:
-        row = session.get(SpecRecord, spec_id)
-        if row is None:
-            raise _not_found("spec")
+        row = _owned(session, SpecRecord, spec_id, user, "spec")
         # A user-edited spec is authoritative: clear the machine's questions.
         spec = update.spec.model_copy(update={"clarifying_questions": []})
         row.spec = spec.model_dump(mode="json")
@@ -306,12 +294,10 @@ def update_spec(spec_id: str, update: SpecUpdate) -> SpecResponse:
         return SpecResponse(id=row.id, spec=spec, needs_clarification=False)
 
 
-@app.get("/specs/{spec_id}", response_model=SpecResponse, dependencies=AUTH)
-def get_spec(spec_id: str) -> SpecResponse:
+@app.get("/specs/{spec_id}", response_model=SpecResponse)
+def get_spec(spec_id: str, user: User = Depends(current_user)) -> SpecResponse:
     with session_scope() as session:
-        row = session.get(SpecRecord, spec_id)
-        if row is None:
-            raise _not_found("spec")
+        row = _owned(session, SpecRecord, spec_id, user, "spec")
         spec = ProjectSpec.model_validate(row.spec)
         return SpecResponse(id=row.id, spec=spec, needs_clarification=spec.is_ambiguous)
 
@@ -319,8 +305,14 @@ def get_spec(spec_id: str) -> SpecResponse:
 # -- analyses -----------------------------------------------------------------------
 
 
-def _require_dataset(session, dataset_id: str, what: str = "dataset") -> DatasetRecord:
-    record = session.get(DatasetRecord, dataset_id)
+def _require_dataset(session, dataset_id: str, what: str = "dataset",
+                     user: Optional[User] = None) -> DatasetRecord:
+    """A usable dataset. With `user`, it must be theirs; without, it is a seller's
+    listed data being read for a blind evaluation."""
+    if user is not None:
+        record = _owned(session, DatasetRecord, dataset_id, user, what)
+    else:
+        record = session.get(DatasetRecord, dataset_id)
     if record is None:
         raise _not_found(what)
     if not record.storage_ref:
@@ -328,22 +320,23 @@ def _require_dataset(session, dataset_id: str, what: str = "dataset") -> Dataset
     return record
 
 
-@app.post("/analyses", response_model=AnalysisStatus, status_code=202, dependencies=AUTH)
-def create_analysis(request: AnalysisRequest) -> AnalysisStatus:
+@app.post("/analyses", response_model=AnalysisStatus, status_code=202)
+def create_analysis(request: AnalysisRequest,
+                    user: User = Depends(current_user)) -> AnalysisStatus:
     """Start an async analysis job."""
     if request.mode != "A":
         raise HTTPException(
             status_code=400,
             detail="only Mode A runs here; blind (Mode B) evaluations start from /deals")
     with session_scope() as session:
-        _require_dataset(session, request.dataset_id)
-        if session.get(SpecRecord, request.spec_id) is None:
-            raise _not_found("spec")
+        _require_dataset(session, request.dataset_id, user=user)
+        _owned(session, SpecRecord, request.spec_id, user, "spec")
         if request.reference_dataset_id:
-            _require_dataset(session, request.reference_dataset_id, "reference dataset")
+            _require_dataset(session, request.reference_dataset_id, "reference dataset",
+                             user=user)
         job = JobRecord(dataset_id=request.dataset_id, spec_id=request.spec_id,
                         reference_dataset_id=request.reference_dataset_id,
-                        mode="A", status=JobStatus.QUEUED.value)
+                        mode="A", status=JobStatus.QUEUED.value, owner_id=user.id)
         session.add(job)
         session.commit()
         status = _job_status(session, job)
@@ -351,19 +344,19 @@ def create_analysis(request: AnalysisRequest) -> AnalysisStatus:
     return status
 
 
-@app.get("/analyses/{job_id}", response_model=AnalysisStatus, dependencies=AUTH)
-def get_analysis(job_id: str) -> AnalysisStatus:
+@app.get("/analyses/{job_id}", response_model=AnalysisStatus)
+def get_analysis(job_id: str, user: User = Depends(current_user)) -> AnalysisStatus:
     with session_scope() as session:
-        job = session.get(JobRecord, job_id)
-        if job is None:
-            raise _not_found("analysis")
+        job = _owned(session, JobRecord, job_id, user, "analysis")
         return _job_status(session, job)
 
 
-@app.get("/analyses", response_model=list[AnalysisStatus], dependencies=AUTH)
-def list_analyses(limit: int = Query(25, ge=1, le=100)) -> list[AnalysisStatus]:
+@app.get("/analyses", response_model=list[AnalysisStatus])
+def list_analyses(limit: int = Query(25, ge=1, le=100),
+                  user: User = Depends(current_user)) -> list[AnalysisStatus]:
     with session_scope() as session:
-        jobs = (session.query(JobRecord).filter(JobRecord.mode == "A")
+        jobs = (session.query(JobRecord)
+                .filter(JobRecord.mode == "A", JobRecord.owner_id == user.id)
                 .order_by(JobRecord.created_at.desc()).limit(limit).all())
         return [_job_status(session, j) for j in jobs]
 
@@ -371,20 +364,26 @@ def list_analyses(limit: int = Query(25, ge=1, le=100)) -> list[AnalysisStatus]:
 # -- reports ------------------------------------------------------------------------
 
 
-def _report_context(session, report_id: str
+def _report_context(session, report_id: str, user: User, owner_only: bool = False
                     ) -> tuple[ReportRecord, Optional[JobRecord], Optional[DatasetRecord]]:
+    """A report the user may read: their own, or — for a blind, score-only report —
+    the one on a listing they sold. Anything else is reported as not found."""
     record = session.get(ReportRecord, report_id)
-    if record is None:
+    allowed = record is not None and record.owner_id == user.id
+    if record is not None and not allowed and record.blind and not owner_only:
+        deal = session.query(DealRecord).filter_by(report_id=record.id).first()
+        allowed = deal is not None and deal.seller_id == user.id
+    if record is None or not allowed:
         raise _not_found("report")
     job = session.get(JobRecord, record.job_id)
     dataset = session.get(DatasetRecord, job.dataset_id) if job else None
     return record, job, dataset
 
 
-def _export_inputs(report_id: str):
+def _export_inputs(report_id: str, user: User):
     """Load the dataset and full quarantine list behind a report, or refuse."""
     with session_scope() as session:
-        record, _, dataset = _report_context(session, report_id)
+        record, _, dataset = _report_context(session, report_id, user, owner_only=True)
         if record.blind:
             raise HTTPException(status_code=403,
                                 detail="blind evaluations expose scores only")
@@ -411,10 +410,10 @@ def _frame_response(df: pl.DataFrame, filename: str, fmt: str) -> Response:
         "Content-Disposition": f'attachment; filename="{safe}.{fmt}"'})
 
 
-@app.get("/reports/{report_id}", response_model=ReportResponse, dependencies=AUTH)
-def get_report(report_id: str) -> ReportResponse:
+@app.get("/reports/{report_id}", response_model=ReportResponse)
+def get_report(report_id: str, user: User = Depends(current_user)) -> ReportResponse:
     with session_scope() as session:
-        record, _, dataset = _report_context(session, report_id)
+        record, _, dataset = _report_context(session, report_id, user)
         blind = bool(record.blind)
         deal = (session.query(DealRecord).filter_by(report_id=record.id).first()
                 if blind else None)
@@ -429,41 +428,43 @@ def get_report(report_id: str) -> ReportResponse:
             report=record.payload)
 
 
-@app.get("/reports/{report_id}/markdown", response_class=PlainTextResponse,
-         dependencies=AUTH)
-def get_report_markdown(report_id: str) -> str:
+@app.get("/reports/{report_id}/markdown", response_class=PlainTextResponse)
+def get_report_markdown(report_id: str, user: User = Depends(current_user)) -> str:
     with session_scope() as session:
-        record, _, _ = _report_context(session, report_id)
+        record, _, _ = _report_context(session, report_id, user)
         return render_markdown(Report.model_validate(record.payload))
 
 
-@app.get("/reports/{report_id}/clean", dependencies=AUTH)
+@app.get("/reports/{report_id}/clean")
 def download_clean(report_id: str, format: str = Query("csv", pattern="^(csv|jsonl)$"),
-                   redact_pii: bool = False) -> Response:
+                   redact_pii: bool = False,
+                   user: User = Depends(current_user)) -> Response:
     """The dataset with quarantined rows removed (or PII masked in place)."""
-    ds, quarantine = _export_inputs(report_id)
+    ds, quarantine = _export_inputs(report_id, user)
     cleaned = export.clean_frame(ds, quarantine, min_severity=Severity.WARNING,
                                  redact_pii=redact_pii)
     return _frame_response(cleaned, f"{Path(ds.name).stem}.clean", format)
 
 
-@app.get("/reports/{report_id}/quarantine", dependencies=AUTH)
+@app.get("/reports/{report_id}/quarantine")
 def download_quarantine(report_id: str,
-                        format: str = Query("csv", pattern="^(csv|jsonl)$")) -> Response:
+                        format: str = Query("csv", pattern="^(csv|jsonl)$"),
+                        user: User = Depends(current_user)) -> Response:
     """The quarantined rows with the reason each was pulled."""
-    ds, quarantine = _export_inputs(report_id)
+    ds, quarantine = _export_inputs(report_id, user)
     return _frame_response(export.quarantine_frame(ds, quarantine),
                            f"{Path(ds.name).stem}.quarantine", format)
 
 
-@app.get("/reports/{report_id}/rows", response_model=RowsResponse, dependencies=AUTH)
-def preview_rows(report_id: str, indices: str = Query(..., max_length=2000)) -> RowsResponse:
+@app.get("/reports/{report_id}/rows", response_model=RowsResponse)
+def preview_rows(report_id: str, indices: str = Query(..., max_length=2000),
+                 user: User = Depends(current_user)) -> RowsResponse:
     """Row contents for the quarantine explorer (never available for blind reports)."""
     try:
         wanted = sorted({int(i) for i in indices.split(",") if i.strip()})[:MAX_PREVIEW_ROWS]
     except ValueError:
         raise HTTPException(status_code=400, detail="indices must be comma-separated integers")
-    ds, _ = _export_inputs(report_id)
+    ds, _ = _export_inputs(report_id, user)
     wanted = [i for i in wanted if 0 <= i < ds.n_rows]
     frame = ds.df.with_row_index("row_index")[wanted] if wanted else ds.df.head(0)
     rows = []
@@ -490,83 +491,111 @@ def _event(name: str, **extra: Any) -> dict[str, Any]:
     return {"event": name, "at": datetime.now(timezone.utc).isoformat(), **extra}
 
 
-def _deal_out(session, deal: DealRecord) -> DealOut:
+# While a deal is in one of these states anyone signed in can see it in the
+# marketplace; in the others only its seller and evaluating buyer can.
+_PUBLIC_DEAL_STATES = (DealState.LISTED.value, DealState.EVALUATED.value,
+                       DealState.DECLINED.value)
+
+
+def _is_party(deal: DealRecord, user: User) -> bool:
+    return user.id in (deal.seller_id, deal.evaluator_id)
+
+
+def _visible_deal(session, deal_id: str, user: User) -> DealRecord:
+    deal = session.get(DealRecord, deal_id)
+    if deal is None or not (_is_party(deal, user) or deal.state in _PUBLIC_DEAL_STATES):
+        raise _not_found("deal")
+    return deal
+
+
+def _deal_out(session, deal: DealRecord, user: User) -> DealOut:
+    """The deal as `user` may see it. A stranger sees the listing; the evaluation
+    outcome, its report and the deal's history belong to the two parties."""
+    party = _is_party(deal, user)
     dataset = session.get(DatasetRecord, deal.dataset_id)
-    report = session.get(ReportRecord, deal.report_id) if deal.report_id else None
+    report = (session.get(ReportRecord, deal.report_id)
+              if party and deal.report_id else None)
     columns = {name: col.get("kind", "other")
                for name, col in ((dataset.profile or {}).get("columns", {}).items()
                                  if dataset else [])}
     return DealOut(
         id=deal.id, title=deal.title, description=deal.description,
-        asking_price=deal.asking_price, state=deal.state,
+        asking_price=deal.asking_price,
+        state=deal.state if party else DealState.LISTED.value,
         n_rows=dataset.n_rows if dataset else 0, n_cols=dataset.n_cols if dataset else 0,
         format=dataset.format if dataset else "", columns=columns,
         fingerprint_prefix=(dataset.fingerprint[:12] if dataset else ""),
-        report_id=deal.report_id,
+        report_id=deal.report_id if party else None,
         verdict=report.verdict if report else None,
         safety_score=report.safety_score if report else None,
         fit_score=report.fit_score if report else None,
-        history=deal.history or [], created_at=deal.created_at)
+        history=(deal.history or []) if party else [],
+        is_seller=deal.seller_id == user.id, is_evaluator=deal.evaluator_id == user.id,
+        created_at=deal.created_at)
 
 
-@app.post("/deals", response_model=DealOut, status_code=201, dependencies=AUTH)
-def create_deal(request: DealCreate) -> DealOut:
+@app.post("/deals", response_model=DealOut, status_code=201)
+def create_deal(request: DealCreate, user: User = Depends(current_user)) -> DealOut:
     """Seller: list a dataset for blind evaluation."""
     with session_scope() as session:
-        _require_dataset(session, request.dataset_id)
+        _require_dataset(session, request.dataset_id, user=user)
         deal = DealRecord(dataset_id=request.dataset_id, title=request.title,
                           description=request.description,
-                          asking_price=request.asking_price, history=[_event("listed")])
+                          asking_price=request.asking_price, history=[_event("listed")],
+                          seller_id=user.id)
         session.add(deal)
         session.commit()
-        return _deal_out(session, deal)
+        return _deal_out(session, deal, user)
 
 
-@app.get("/deals", response_model=list[DealOut], dependencies=AUTH)
-def list_deals(limit: int = Query(50, ge=1, le=200)) -> list[DealOut]:
+@app.get("/deals", response_model=list[DealOut])
+def list_deals(limit: int = Query(50, ge=1, le=200),
+               user: User = Depends(current_user)) -> list[DealOut]:
     with session_scope() as session:
-        deals = (session.query(DealRecord).order_by(DealRecord.created_at.desc())
-                 .limit(limit).all())
-        return [_deal_out(session, d) for d in deals]
+        deals = (session.query(DealRecord)
+                 .filter(or_(DealRecord.state.in_(_PUBLIC_DEAL_STATES),
+                             DealRecord.seller_id == user.id,
+                             DealRecord.evaluator_id == user.id))
+                 .order_by(DealRecord.created_at.desc()).limit(limit).all())
+        return [_deal_out(session, d, user) for d in deals]
 
 
-@app.get("/deals/{deal_id}", response_model=DealOut, dependencies=AUTH)
-def get_deal(deal_id: str) -> DealOut:
+@app.get("/deals/{deal_id}", response_model=DealOut)
+def get_deal(deal_id: str, user: User = Depends(current_user)) -> DealOut:
     with session_scope() as session:
-        deal = session.get(DealRecord, deal_id)
-        if deal is None:
-            raise _not_found("deal")
-        return _deal_out(session, deal)
+        return _deal_out(session, _visible_deal(session, deal_id, user), user)
 
 
-@app.post("/deals/{deal_id}/evaluations", response_model=AnalysisStatus, status_code=202,
-          dependencies=AUTH)
-def evaluate_deal(deal_id: str, request: EvaluationRequest) -> AnalysisStatus:
+@app.post("/deals/{deal_id}/evaluations", response_model=AnalysisStatus, status_code=202)
+def evaluate_deal(deal_id: str, request: EvaluationRequest,
+                  user: User = Depends(current_user)) -> AnalysisStatus:
     """Buyer: run the engine against the listed data; only the score comes back."""
     with session_scope() as session:
-        deal = session.get(DealRecord, deal_id)
-        if deal is None:
-            raise _not_found("deal")
+        deal = _visible_deal(session, deal_id, user)
         if deal.state not in (DealState.LISTED.value, DealState.EVALUATED.value,
                               DealState.DECLINED.value):
             raise HTTPException(status_code=409,
                                 detail=f"deal is {deal.state}; it cannot be evaluated now")
         _require_dataset(session, deal.dataset_id, "listed dataset")
         if request.reference_dataset_id:
-            _require_dataset(session, request.reference_dataset_id, "reference dataset")
+            _require_dataset(session, request.reference_dataset_id, "reference dataset",
+                             user=user)
 
-        dataset = _load_for_spec(session, deal.dataset_id)
+        dataset = _load_for_spec(session, deal.dataset_id, None)
         spec = compile_spec(request.description, dataset,
                             target_column=request.target_column,
                             project_brief=request.project_brief)
-        spec_row = SpecRecord(dataset_id=deal.dataset_id, spec=spec.model_dump(mode="json"))
+        spec_row = SpecRecord(dataset_id=deal.dataset_id, spec=spec.model_dump(mode="json"),
+                              owner_id=user.id)
         session.add(spec_row)
         session.flush()
         job = JobRecord(dataset_id=deal.dataset_id, spec_id=spec_row.id,
                         reference_dataset_id=request.reference_dataset_id,
-                        deal_id=deal.id, mode="B", status=JobStatus.QUEUED.value)
+                        deal_id=deal.id, mode="B", status=JobStatus.QUEUED.value,
+                        owner_id=user.id)
         session.add(job)
         deal.state = DealState.EVALUATING.value
+        deal.evaluator_id = user.id
         deal.history = [*(deal.history or []), _event("evaluation_started")]
         session.commit()
         status = _job_status(session, job, reveal_filename=False)
@@ -574,38 +603,42 @@ def evaluate_deal(deal_id: str, request: EvaluationRequest) -> AnalysisStatus:
     return status
 
 
-@app.post("/deals/{deal_id}/decision", response_model=DealOut, dependencies=AUTH)
-def decide_deal(deal_id: str, request: DealDecision) -> DealOut:
+@app.post("/deals/{deal_id}/decision", response_model=DealOut)
+def decide_deal(deal_id: str, request: DealDecision,
+                user: User = Depends(current_user)) -> DealOut:
     """Buyer: accept or decline after reading the score-only report."""
     with session_scope() as session:
-        deal = session.get(DealRecord, deal_id)
-        if deal is None:
-            raise _not_found("deal")
+        deal = _visible_deal(session, deal_id, user)
         if deal.state != DealState.EVALUATED.value:
             raise HTTPException(status_code=409,
                                 detail="a deal can only be decided after it is evaluated")
+        if deal.evaluator_id != user.id:
+            raise HTTPException(
+                status_code=403,
+                detail="only the buyer who ran the evaluation can accept or decline")
         accepted = request.decision == "accept"
         deal.state = (DealState.ACCEPTED if accepted else DealState.DECLINED).value
         deal.history = [*(deal.history or []),
                         _event("accepted" if accepted else "declined")]
         session.commit()
-        return _deal_out(session, deal)
+        return _deal_out(session, deal, user)
 
 
-@app.post("/deals/{deal_id}/withdraw", response_model=DealOut, dependencies=AUTH)
-def withdraw_deal(deal_id: str) -> DealOut:
+@app.post("/deals/{deal_id}/withdraw", response_model=DealOut)
+def withdraw_deal(deal_id: str, user: User = Depends(current_user)) -> DealOut:
     """Seller: take the listing down."""
     with session_scope() as session:
-        deal = session.get(DealRecord, deal_id)
-        if deal is None:
-            raise _not_found("deal")
+        deal = _visible_deal(session, deal_id, user)
+        if deal.seller_id != user.id:
+            raise HTTPException(status_code=403,
+                                detail="only the seller can withdraw a listing")
         if deal.state in (DealState.ACCEPTED.value, DealState.EVALUATING.value):
             raise HTTPException(status_code=409,
                                 detail=f"a deal that is {deal.state} cannot be withdrawn")
         deal.state = DealState.WITHDRAWN.value
         deal.history = [*(deal.history or []), _event("withdrawn")]
         session.commit()
-        return _deal_out(session, deal)
+        return _deal_out(session, deal, user)
 
 
 # -- helpers ------------------------------------------------------------------------

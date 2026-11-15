@@ -25,9 +25,10 @@ from datetime import datetime, timezone
 
 from datagate import blind, signing
 from datagate.orchestrator import analyze
-from datagate.registry import Registry
+from datagate.service.auth import registry_for
 from datagate.service.config import settings
 from datagate.service.db import (
+    LOCAL_USER_ID,
     DatasetRecord,
     DealRecord,
     DealState,
@@ -106,6 +107,7 @@ def _run_job(job_id: str) -> None:
                      if job.reference_dataset_id else None)
         deal = session.get(DealRecord, job.deal_id) if job.deal_id else None
         mode, deal_id = job.mode, job.deal_id
+        owner_id = job.owner_id or LOCAL_USER_ID
         deal_title = deal.title if deal else ""
         dataset_ref, dataset_name = dataset.storage_ref, dataset.filename
         reference_ref = reference.storage_ref if reference else None
@@ -123,7 +125,7 @@ def _run_job(job_id: str) -> None:
                             if reference_ref else None),
             dataset_name=dataset_name,
             reference_name=reference_name,
-            registry=Registry(),
+            registry=registry_for(owner_id),
             progress=_progress_sink(job_id),
         )
         report, quarantine = result.report, result.quarantine
@@ -156,6 +158,7 @@ def _run_job(job_id: str) -> None:
                 quarantine_ref=quarantine_ref,
                 blind=1 if mode == "B" else 0,
                 engine_version=report.engine_version,
+                owner_id=job.owner_id,
             )
             session.add(record)
             session.flush()

@@ -37,9 +37,12 @@ class Settings:
         # Comma-separated keys. Unset = open (local dev only).
         raw_keys = os.environ.get("DATAGATE_API_KEYS", "")
         self.api_keys: set[str] = {k.strip() for k in raw_keys.split(",") if k.strip()}
-        # Shared password for the whole site (UI and API), via the browser's
-        # built-in login prompt. Unset = no gate (local dev only).
-        self.access_password: str = os.environ.get("DATAGATE_ACCESS_PASSWORD", "")
+        # Accounts. Off (default) = one implicit local user, no login screen —
+        # fine on your own machine. On = people sign up, sign in, and see only
+        # their own data. The Docker image turns it on.
+        self.require_login: bool = os.environ.get(
+            "DATAGATE_REQUIRE_LOGIN", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.session_days: int = int(os.environ.get("DATAGATE_SESSION_DAYS", "30"))
 
     @property
     def auth_enabled(self) -> bool:

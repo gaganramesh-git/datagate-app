@@ -16,7 +16,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import polars as pl
 
@@ -44,6 +44,18 @@ class Match:
     containment: float   # share of the candidate's rows found in the known dataset
     exact: bool          # byte-identical file
     coverage: float = 0.0  # share of the known dataset's rows found in the candidate
+
+
+def registry_for_user(owner_id: str, local_id: str = "local") -> "Registry":
+    """The registry one account sees: its own uploads plus the shared entries.
+
+    The implicit local user keeps using the shared registry directly, exactly as
+    before accounts existed.
+    """
+    if owner_id == local_id:
+        return Registry()
+    return Registry(root=paths.registry_dir() / "users" / owner_id,
+                    shared=[paths.registry_dir()])
 
 
 def row_sketch(dataset: Dataset) -> list[int]:
@@ -86,9 +98,15 @@ def containment(a: list[int], b: list[int]) -> float:
 
 
 class Registry:
-    def __init__(self, root: Optional[Path] = None) -> None:
+    """Sketches live under `root`. `shared` roots are read-only extras that `entries`
+    and `match` also see — how one user's uploads are checked against the shared
+    benchmark entries without ever seeing another user's uploads."""
+
+    def __init__(self, root: Optional[Path] = None,
+                 shared: Sequence[Path] = ()) -> None:
         self.root = Path(root) if root else paths.registry_dir()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.shared = [Path(p) for p in shared]
 
     def _path(self, fingerprint: str) -> Path:
         return self.root / f"{fingerprint[:32]}.json"
@@ -103,18 +121,25 @@ class Registry:
         self._path(entry.fingerprint).write_text(json.dumps(asdict(entry)))
         return entry
 
-    def entries(self) -> list[Entry]:
+    def _read(self, root: Path) -> list[Entry]:
         out = []
-        for p in sorted(self.root.glob("*.json")):
+        for p in sorted(root.glob("*.json")):
             try:
                 out.append(Entry(**json.loads(p.read_text())))
             except (ValueError, TypeError):
                 continue  # ignore a corrupt entry rather than fail every analysis
         return out
 
+    def entries(self) -> list[Entry]:
+        own = self._read(self.root)
+        seen = {e.fingerprint for e in own}
+        extra = [e for root in self.shared for e in self._read(root)
+                 if e.fingerprint not in seen]
+        return own + extra
+
     def remove(self, name_or_fingerprint: str) -> int:
         removed = 0
-        for entry in self.entries():
+        for entry in self._read(self.root):
             if name_or_fingerprint in (entry.name, entry.fingerprint,
                                        entry.fingerprint[:12]):
                 self._path(entry.fingerprint).unlink(missing_ok=True)
