@@ -1,0 +1,54 @@
+[project]
+name = "datagate"
+version = "0.2.0"
+description = "Pre-ingestion checkpoint for training data: is it safe, and will it help my model?"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "polars>=1.0",
+    "pyarrow>=16.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    "cryptography>=42",
+    "datasketch>=1.6",
+    "pydantic>=2.7",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+service = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "python-multipart>=0.0.9",
+]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.100",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+datagate = "datagate.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/datagate"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Pinned explicitly so a newer ruff's changed defaults can't fail CI.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
