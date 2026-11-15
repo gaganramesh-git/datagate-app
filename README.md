@@ -5,6 +5,10 @@ A checkpoint for training data. Before a dataset goes anywhere near your model, 
 - **Is it safe?** Mislabels, duplicates, personal data and secrets, hidden characters, poisoning and backdoor triggers, overlap with your eval set.
 - **Will it actually help *my* model?** Measured against a sample of your own task data — without a full training run.
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/gaganramesh-git/datagate-app?quickstart=1)
+
+**Try it in your browser:** click the button above. GitHub builds a private copy from this repo (a couple of minutes the first time), starts DataGate, and opens it in a new tab. It runs on your own free Codespaces hours and stops by itself when idle. Nothing to install.
+
 It ends with a decision, not just scores: **PASS**, **REVIEW** or **BLOCK**, with the reasons, the rows to pull, and a cleaned file to use instead.
 
 ```text

@@ -140,6 +140,19 @@ def test_cross_origin_writes_are_refused(api):
         assert same.status_code == 201
 
 
+def test_a_proxy_that_rewrites_the_host_still_works(api):
+    # GitHub Codespaces forwards to localhost and passes the public address on.
+    public = "fluffy-robot-8000.app.github.dev"
+    with TestClient(api.app) as client:
+        body = {"email": "ann@example.com", "password": PASSWORD}
+        ok = client.post("/auth/signup", json=body,
+                         headers={"Origin": f"https://{public}", "X-Forwarded-Host": public})
+        assert ok.status_code == 201
+        evil = client.post("/auth/login", json=body,
+                           headers={"Origin": "https://evil.example", "X-Forwarded-Host": public})
+        assert evil.status_code == 403
+
+
 def test_without_accounts_it_is_one_open_local_user(tmp_path: Path,
                                                     monkeypatch: pytest.MonkeyPatch):
     with TestClient(_boot(tmp_path, monkeypatch).app) as client:

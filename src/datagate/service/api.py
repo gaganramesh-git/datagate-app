@@ -100,13 +100,24 @@ app.include_router(auth_router)
 _UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 
 
+def _own_hosts(request) -> set[str]:
+    """The addresses this server is reached at. Behind a proxy (GitHub Codespaces,
+    most hosts) the Host header can be the internal address, while the public one
+    arrives as X-Forwarded-Host. A forged cross-site request cannot set that
+    header, so trusting it here does not weaken the check."""
+    hosts = {request.headers.get("host", "")}
+    forwarded = request.headers.get("x-forwarded-host", "")
+    hosts.update(h.strip() for h in forwarded.split(",") if h.strip())
+    return hosts
+
+
 # Belt and braces on top of SameSite=Lax cookies: a state-changing request that
 # names a different origin than the host it was sent to is refused.
 @app.middleware("http")
 async def origin_guard(request, call_next):
     origin = request.headers.get("origin")
     if (request.method in _UNSAFE and origin
-            and urlparse(origin).netloc != request.headers.get("host", "")):
+            and urlparse(origin).netloc not in _own_hosts(request)):
         return PlainTextResponse("Cross-origin request refused.", status_code=403)
     return await call_next(request)
 
