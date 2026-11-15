@@ -154,11 +154,11 @@ Infrastructure sits behind small seams, with zero-setup defaults:
 | Database | SQLite (WAL) via SQLAlchemy | Postgres — `DATAGATE_DATABASE_URL` |
 | Blob storage | local, content-addressed | S3/MinIO — implement `Storage` |
 | Job queue | in-process thread pool | Celery/Arq — reimplement `worker.submit()` |
-| Auth | open, for local use | `DATAGATE_API_KEYS=key1,key2` |
+| Auth | open, for local use | `DATAGATE_ACCESS_PASSWORD` (shared password) · `DATAGATE_API_KEYS=key1,key2` (API clients) |
 
-Configuration: `DATAGATE_HOME` (default `./var`), `DATAGATE_DATABASE_URL`, `DATAGATE_STORAGE_DIR`, `DATAGATE_WORKERS`, `DATAGATE_MAX_UPLOAD_BYTES`, `DATAGATE_API_KEYS`, `DATAGATE_USE_LLM`, `DATAGATE_LLM_API_KEY`, `DATAGATE_LLM_MODEL`.
+Configuration: `DATAGATE_HOME` (default `./var`), `DATAGATE_DATABASE_URL`, `DATAGATE_STORAGE_DIR`, `DATAGATE_WORKERS`, `DATAGATE_MAX_UPLOAD_BYTES`, `DATAGATE_API_KEYS`, `DATAGATE_ACCESS_PASSWORD`, `DATAGATE_USE_LLM`, `DATAGATE_LLM_API_KEY`, `DATAGATE_LLM_MODEL`.
 
-A `Dockerfile` is included but was written without a Docker daemon available — build and test it before relying on it. If you expose the service beyond localhost, set `DATAGATE_API_KEYS`; the download links in the UI do not send a key, so the UI is intended for local use.
+A `Dockerfile` is included but was written without a Docker daemon available — build and test it before relying on it. **Putting it on the internet.** Set `DATAGATE_ACCESS_PASSWORD` to lock the whole site (UI and API) behind one shared password, using the browser's built-in login prompt. Any username works; only the password is checked, and `/health` stays open for platform health checks. It is one shared password, not per-user accounts, so everyone who gets in sees every report. Don't also set `DATAGATE_API_KEYS` for the web UI: the UI cannot send an API key. Use HTTPS in front (Render and most hosts provide it), because Basic auth sends the password with every request.
 
 ### Blind evaluation (marketplace preview)
 

@@ -37,6 +37,9 @@ class Settings:
         # Comma-separated keys. Unset = open (local dev only).
         raw_keys = os.environ.get("DATAGATE_API_KEYS", "")
         self.api_keys: set[str] = {k.strip() for k in raw_keys.split(",") if k.strip()}
+        # Shared password for the whole site (UI and API), via the browser's
+        # built-in login prompt. Unset = no gate (local dev only).
+        self.access_password: str = os.environ.get("DATAGATE_ACCESS_PASSWORD", "")
 
     @property
     def auth_enabled(self) -> bool:

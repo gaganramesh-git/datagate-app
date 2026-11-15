@@ -370,3 +370,45 @@ def test_blind_evaluation_only_the_score_leaves(client, files):
     assert client.post(f"/deals/{deal['id']}/withdraw").json()["state"] == "withdrawn"
     again = client.post(f"/deals/{deal['id']}/evaluations", json={"description": PURPOSE})
     assert again.status_code == 409
+
+
+# -- shared-password gate -----------------------------------------------------------
+
+
+@pytest.fixture
+def gated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    api = _boot(tmp_path, monkeypatch, DATAGATE_ACCESS_PASSWORD="open-sesame")
+    with TestClient(api.app) as c:
+        yield c
+
+
+def test_gate_is_off_unless_a_password_is_set(client):
+    assert client.get("/meta").status_code == 200
+    assert client.get("/").status_code == 200
+
+
+def test_gate_refuses_requests_without_the_password(gated):
+    for path in ("/", "/meta", "/app.js", "/history"):
+        res = gated.get(path)
+        assert res.status_code == 401, path
+        assert res.headers["WWW-Authenticate"].startswith("Basic")
+    # A refused request still carries the security headers.
+    assert gated.get("/meta").headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_gate_refuses_a_wrong_password_and_accepts_the_right_one(gated):
+    assert gated.get("/meta", auth=("anyone", "wrong")).status_code == 401
+    assert gated.get("/meta", auth=("anyone", "")).status_code == 401
+    assert gated.get("/meta", auth=("anyone", "open-sesame")).status_code == 200
+    # The username is not checked; passwords containing ':' work too.
+    assert gated.get("/", auth=("", "open-sesame")).status_code == 200
+
+
+def test_gate_leaves_health_open_for_platform_checks(gated):
+    assert gated.get("/health").status_code == 200
+
+
+@pytest.mark.parametrize("header", ["Basic", "Basic !!!not-base64!!!", "Bearer open-sesame",
+                                    "Basic /w==", "garbage"])
+def test_gate_survives_malformed_authorization_headers(gated, header):
+    assert gated.get("/meta", headers={"Authorization": header}).status_code == 401

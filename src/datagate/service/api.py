@@ -11,6 +11,7 @@ receives a signed, score-only report. No payments, identity or escrow yet.
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 from contextlib import asynccontextmanager
@@ -92,6 +93,37 @@ app = FastAPI(
     description="Is this dataset safe, and will it help my model?",
     lifespan=lifespan,
 )
+
+
+_GATE_OPEN_PATHS = {"/health"}   # health checks must work without credentials
+
+
+def _password_ok(header: str | None) -> bool:
+    """True when an `Authorization: Basic ...` header carries the shared password.
+
+    The username is ignored; only the password is checked, in constant time.
+    """
+    if not header or not header.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    _, _, password = decoded.partition(":")
+    return hmac.compare_digest(password.encode("utf8"),
+                               settings.access_password.encode("utf8"))
+
+
+# Defined before `security_headers` so that one wraps it: a refused request still
+# gets the security headers.
+@app.middleware("http")
+async def password_gate(request, call_next):
+    if (settings.access_password and request.url.path not in _GATE_OPEN_PATHS
+            and not _password_ok(request.headers.get("authorization"))):
+        return PlainTextResponse(
+            "Password required.", status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="DataGate", charset="UTF-8"'})
+    return await call_next(request)
 
 
 @app.middleware("http")
